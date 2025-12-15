@@ -1,1 +1,1 @@
-# capstone-project
+# parallel training script
