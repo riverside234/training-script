@@ -23,6 +23,9 @@ from transformers import AutoConfig
 from model_load import load_local_hf_weights
 from torch.utils.data.distributed import DistributedSampler
 from lora import LoRALinear
+from torch.profiler import profile, ProfilerActivity
+from contextlib import nullcontext
+import deepspeed.comm as dist_deepspeed
 
 #----------------ini deepspeed
 deepspeed.init_distributed()
@@ -31,14 +34,26 @@ local_rank = int(os.environ["LOCAL_RANK"])
 
 torch.cuda.set_device(local_rank)
 
+#profiling for rank0 process, gpu0
+is_rank0 = (dist.get_rank() == 0)  
+
+prof_ctx = profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    profile_memory=True,
+    with_flops=True,
+    with_modules=True,
+    with_stack=True,
+) if is_rank0 else nullcontext() 
+
 #----------------- Ini model with pipeline
 model_id = "unsloth/Llama-4-Scout-17B-16E-Instruct"
 model_dir = "/scratch/user/u.yx314365/cache/model1"
 cache_dir = "/scratch/user/u.yx314365/cache"
 
-tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True, cache_dir=cache_dir)
+tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True, cache_dir=cache_dir, model_max_length=4096)
 
 cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True, cache_dir=cache_dir)
+cfg._attn_implementation = "sdpa" 
 
 text_cfg = getattr(cfg, "text_config", None)
 if text_cfg is None:
@@ -50,24 +65,24 @@ n_layers = text_cfg.num_hidden_layers
 
 specs = [
     LayerSpec(EmbedPipe, text_cfg),
-    *[LayerSpec(DecoderLayerPipe, text_cfg, i, lora_r=8, lora_alpha=8, lora_dropout=0.05)
+    *[LayerSpec(DecoderLayerPipe, text_cfg, i, lora_r=4, lora_alpha=8, lora_dropout=0.05)
       for i in range(n_layers)],
     LayerSpec(FinalNormPipe, text_cfg),
     LayerSpec(LMHeadPipe, text_cfg),
 ]
 
 old = torch.get_default_dtype()
-torch.set_default_dtype(torch.float32)
+torch.set_default_dtype(torch.bfloat16)
 
 pipe = PipelineModule(
     layers=specs,
     loss_fn=causal_lm_loss,
-    num_stages=6,
+    num_stages=4,
     partition_method="uniform",  
-    activation_checkpoint_interval=1,
 )
 
 torch.set_default_dtype(old)
+
 print("finished\n")
 #-------------------ini training engine
 for p in pipe.parameters():
@@ -80,7 +95,7 @@ for m in pipe.modules():
         
 trainable_params = [p for p in pipe.parameters() if p.requires_grad]
 
-optimizer = torch.optim.AdamW(trainable_params, lr=1e-4)
+optimizer = torch.optim.AdamW(trainable_params, lr=1e-6)
 ds_config = "ds_config_0.json"
 
 engine, optimizer, _, _ = deepspeed.initialize(
@@ -94,6 +109,7 @@ load_local_hf_weights(engine, model_dir, text_cfg)
 dist.barrier()
 
 #------------------------data batch prep
+MAX_LEN = 2048
 def to_features(ex):
     messages = ex["messages"]
         
@@ -103,7 +119,7 @@ def to_features(ex):
     enc = tokenizer(
         chat_str,
         truncation=True,
-        max_length=tokenizer.model_max_length,
+        max_length=MAX_LEN,
         padding=False,           
         add_special_tokens=True,
     )
@@ -113,7 +129,7 @@ def to_features(ex):
     }
 
 _base_collator = DataCollatorWithPadding(
-               tokenizer=tokenizer, pad_to_multiple_of=8, return_tensors="pt"
+               tokenizer=tokenizer, padding="max_length",max_length=MAX_LEN, return_tensors="pt"
                 )
 
 def collate_fn(features):
@@ -132,24 +148,24 @@ dataset = load_from_disk(str(data_path))
 dataset = dataset.map(to_features, remove_columns=dataset.column_names, num_proc=2)    
 
 sampler = DistributedSampler(dataset, shuffle=True)
-train_dataloader = DataLoader(dataset, batch_size=4, sampler=sampler, collate_fn=collate_fn)
+train_dataloader = DataLoader(dataset, batch_size=16, sampler=sampler, collate_fn=collate_fn)
 train_iter = iter(RepeatingLoader(train_dataloader))
 
 #-----------------training with profiler  
-flops_prof = FlopsProfiler(engine.module, ds_engine=engine)
+torch.cuda.reset_peak_memory_stats()
 
-PROFILE_AT_STEP = 1
-PROFILE_DURATION = 2
+with prof_ctx as prof:
+    for step in range(2):
+        loss = engine.train_batch(data_iter=train_iter)
+        if is_rank0:
+            prof.step()
 
-for step in range(20):
-    if step == PROFILE_AT_STEP:
-        flops_prof.start_profile()
-        engine.print_rank_0(f"=== START profile step {step} ===")
+peak = torch.cuda.max_memory_allocated()
 
-    loss = engine.train_batch(data_iter=train_iter)  
+if is_rank0:
+    print(prof.key_averages(group_by_stack_n=5).table(sort_by="self_cuda_time_total", row_limit=30))
 
-    if step == PROFILE_AT_STEP + PROFILE_DURATION - 1:
-        flops_prof.stop_profile()
-        engine.print_rank_0(f"=== STOP profile step {step} ===")
-        flops_prof.print_model_profile(profile_step=PROFILE_AT_STEP, module_depth=-1, top_modules=10, detailed=True)
-        break
+t = torch.tensor([peak], device="cuda")
+dist_deepspeed.all_reduce(t, op=dist_deepspeed.ReduceOp.MAX)
+if dist_deepspeed.get_rank() == 0:
+    print(f"Global peak max_memory_allocated: {t.item()/1024**3:.2f} GiB")

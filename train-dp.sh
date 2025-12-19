@@ -4,9 +4,9 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=2
-#SBATCH --mem=200G
-#SBATCH --gres=gpu:h100:6
-#SBATCH --time=0-00:20:00
+#SBATCH --mem=100G
+#SBATCH --gres=gpu:h100:4
+#SBATCH --time=0-00:30:00
 
 # --- LOGGING ---------------------------------------------------------------
 # %x = job name, %A = job ID, %a = array-task ID
@@ -40,6 +40,6 @@ conda activate xu2
 cd /scratch/user/u.yx314365/pp-train/
 
 #ls
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 
-srun deepspeed --num_gpus=6 train-dp-pp.py --deepspeed_config ds_config_0.json
+srun deepspeed --num_gpus=4 train-dp-pp.py --deepspeed_config ds_config_0.json
